@@ -1,18 +1,32 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTournament } from "@/app/context/TournamentContext";
-import { Side, generateRoundMatchesAvoidingPartners, applyResults } from "@/app/lib/tournament";
+import {
+    generateRoundMatchesAvoidingPartners,
+    applyResults,
+    type MatchScore, Player, Side, Match,
+} from "@/app/lib/tournament";
 
 const NUM_COURTS = 5;
 const IOS_FONT = `-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
 "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji"`;
 
+type Snapshot = {
+    players: Player[];
+    roundNumber: number;
+    pastPartners: string[];
+    nextId: number;
+    currentMatches: Match[];
+    currentWinners: Record<number, Side>;
+    updatedAt: number;
+};
+
+
 export default function MatchesPage() {
     const router = useRouter();
     const searchParams = useSearchParams();
-
     const tournamentId = searchParams.get("t") ?? "default";
 
     const {
@@ -24,16 +38,17 @@ export default function MatchesPage() {
         addPartnerKeys,
         currentMatches,
         setCurrentMatches,
-        currentWinners,
         setCurrentWinners,
         loadRemote,
-        saveRemote,
+        nextId,
     } = useTournament();
 
     const matches = currentMatches;
-    const winners = currentWinners;
-
     const [infoMessage, setInfoMessage] = useState<string | null>(null);
+
+    const [scoresByCourt, setScoresByCourt] = useState<
+        Record<number, { side1: string; side2: string }>
+    >({});
 
     const hasActiveRound = matches.length > 0;
 
@@ -47,11 +62,63 @@ export default function MatchesPage() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [tournamentId]);
 
+    const pingOthers = () => {
+        try {
+            const msg = { tournamentId, at: Date.now() };
+
+            if ("BroadcastChannel" in window) {
+                const ch = new BroadcastChannel("tournament-updates");
+                ch.postMessage(msg);
+                ch.close();
+            }
+
+            localStorage.setItem("tournament-update", JSON.stringify(msg));
+        } catch {}
+    };
+
+    const putSnapshot = async (snapshot: Snapshot) => {
+        const res = await fetch(`/api/tournament/${encodeURIComponent(tournamentId)}`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(snapshot),
+        });
+
+        if (!res.ok) {
+            const text = await res.text().catch(() => "");
+            throw new Error(
+                `Failed to save tournament: ${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`
+            );
+        }
+    };
+
+    const setCourtScore = (courtNumber: number, side: "side1" | "side2", value: string) => {
+        setScoresByCourt((prev) => ({
+            ...prev,
+            [courtNumber]: {
+                side1: prev[courtNumber]?.side1 ?? "",
+                side2: prev[courtNumber]?.side2 ?? "",
+                [side]: value,
+            },
+        }));
+    };
+
+    const allScoresEntered = useMemo(() => {
+        if (!hasActiveRound) return false;
+        return matches.every((m) => {
+            const raw = scoresByCourt[m.courtNumber];
+            if (!raw) return false;
+            if (raw.side1 === "" || raw.side2 === "") return false;
+            const s1 = Number(raw.side1);
+            const s2 = Number(raw.side2);
+            if (!Number.isFinite(s1) || !Number.isFinite(s2)) return false;
+            if (s1 < 0 || s2 < 0) return false;
+            return s1 !== s2;
+        });
+    }, [hasActiveRound, matches, scoresByCourt]);
+
     const handleGenerateNextRound = async () => {
         if (hasActiveRound) {
-            setInfoMessage(
-                "You still have an active round. Please save the results before rerolling courts."
-            );
+            setInfoMessage("You still have an active round. Please save the results before rerolling courts.");
             return;
         }
 
@@ -62,61 +129,135 @@ export default function MatchesPage() {
                 new Set(pastPartners)
             );
 
-            setRoundNumber((n) => n + 1);
+            // partner keys for this round
+            const keys =
+                result.usedPairs.length > 0
+                    ? result.usedPairs.map((pair) => {
+                        const id1 = pair.p1.id;
+                        const id2 = pair.p2.id;
+                        return id1 < id2 ? `${id1}-${id2}` : `${id2}-${id1}`;
+                    })
+                    : [];
+
+            const nextPastPartners = keys.length
+                ? Array.from(new Set([...pastPartners, ...keys]))
+                : pastPartners;
+
+            const nextRound = roundNumber + 1;
+
+            // Update UI
+            setRoundNumber(nextRound);
             setCurrentMatches(result.matches);
             setCurrentWinners({});
-
-            if (result.usedPairs.length > 0) {
-                const keys = result.usedPairs.map((pair) => {
-                    const id1 = pair.p1.id;
-                    const id2 = pair.p2.id;
-                    return id1 < id2 ? `${id1}-${id2}` : `${id2}-${id1}`;
-                });
-                addPartnerKeys(keys);
-            }
+            setScoresByCourt({});
+            if (keys.length) addPartnerKeys(keys);
 
             setInfoMessage(
-                result.fallback
-                    ? "Note: could not fully avoid repeated partners for this round."
-                    : null
+                result.fallback ? "Note: could not fully avoid repeated partners for this round." : null
             );
 
-            // Save to KV so other devices see the draw
-            await saveRemote(tournamentId);
+            // Save EXACT snapshot (no stale state risk)
+            await putSnapshot({
+                players,
+                roundNumber: nextRound,
+                pastPartners: nextPastPartners,
+                nextId,
+                currentMatches: result.matches,
+                currentWinners: {},
+                updatedAt: Date.now(),
+            });
+
+            pingOthers();
         } catch (e: any) {
-            setInfoMessage(e?.message || "Error generating round");
+            setInfoMessage(e?.message || "Failed to save draw to server. Round not started.");
             setCurrentMatches([]);
             setCurrentWinners({});
+            setScoresByCourt({});
         }
     };
-
-    const handleSetWinner = (courtNumber: number, side: Side) => {
-        setCurrentWinners((prev) => ({ ...prev, [courtNumber]: side }));
-    };
-
-    const allWinnersSelected =
-        matches.length > 0 && matches.every((m) => Boolean(winners[m.courtNumber]));
 
     const handleSaveResults = async () => {
         if (!hasActiveRound) return;
 
-        if (!allWinnersSelected) {
-            setInfoMessage("Select a winner for every court before saving.");
+        if (!allScoresEntered) {
+            setInfoMessage("Enter both scores for every court (no ties) before saving.");
             return;
         }
 
         try {
-            const updated = applyResults(players, matches, winners);
+            const numericScores: Record<number, MatchScore> = {};
+            for (const m of matches) {
+                const raw = scoresByCourt[m.courtNumber];
+                const s1 = Number(raw.side1);
+                const s2 = Number(raw.side2);
+
+                if (!Number.isFinite(s1) || !Number.isFinite(s2)) {
+                    throw new Error(`Invalid score on court ${m.courtNumber}`);
+                }
+                if (s1 < 0 || s2 < 0) {
+                    throw new Error(`Negative score on court ${m.courtNumber}`);
+                }
+                if (s1 === s2) {
+                    throw new Error(`Scores cannot be equal on court ${m.courtNumber}`);
+                }
+
+                numericScores[m.courtNumber] = { side1: s1, side2: s2 };
+            }
+
+            const updated = applyResults(players, matches, numericScores);
+
+            // Update UI
             setPlayers(updated);
             setCurrentMatches([]);
             setCurrentWinners({});
-            setInfoMessage("Round saved. You can now reroll courts for the next round. 🎄");
+            setScoresByCourt({});
+            setInfoMessage("Round saved. You can now reroll courts for the next round.");
 
-            // Persist updated scores to KV
-            await saveRemote(tournamentId);
+            // ✅ Save EXACT snapshot
+            await putSnapshot({
+                players: updated,
+                roundNumber,
+                pastPartners,
+                nextId,
+                currentMatches: [],
+                currentWinners: {},
+                updatedAt: Date.now(),
+            });
+
+            pingOthers();
         } catch (e: any) {
             setInfoMessage(e?.message || "Failed to save results");
         }
+    };
+
+    const handleShareLeaderboard = async () => {
+        const url = `${window.location.origin}/leaderboard?t=${encodeURIComponent(tournamentId)}`;
+
+        try {
+            if (navigator.share) {
+                await navigator.share({
+                    title: "Xmas Badminton Leaderboard",
+                    text: "Live tournament standings",
+                    url,
+                });
+                return;
+            }
+
+            await navigator.clipboard.writeText(url);
+            setInfoMessage("📋 Leaderboard link copied!");
+        } catch {
+            prompt("Copy this leaderboard link:", url);
+        }
+    };
+
+    const getWinnerLabel = (courtNumber: number) => {
+        const raw = scoresByCourt[courtNumber];
+        if (!raw || raw.side1 === "" || raw.side2 === "") return null;
+        const s1 = Number(raw.side1);
+        const s2 = Number(raw.side2);
+        if (!Number.isFinite(s1) || !Number.isFinite(s2)) return null;
+        if (s1 === s2) return "Tie (not allowed)";
+        return s1 > s2 ? "Side 1 🏆" : "Side 2 🏆";
     };
 
     return (
@@ -128,6 +269,7 @@ export default function MatchesPage() {
                 flexDirection: "column",
                 alignItems: "center",
                 fontFamily: IOS_FONT,
+                background: "linear-gradient(180deg, #020617 0%, #0f172a 40%, #020617 100%)",
             }}
         >
             <header style={{ textAlign: "center", marginBottom: "1rem" }}>
@@ -166,18 +308,15 @@ export default function MatchesPage() {
                 </div>
             )}
 
-            {/* Main card (courts) */}
             <section
                 style={{
                     width: "100%",
                     maxWidth: "1040px",
                     borderRadius: "1.5rem",
                     padding: "1.75rem 2rem",
-                    background:
-                        "linear-gradient(145deg, rgba(15,23,42,0.9), rgba(17,24,39,0.95))",
+                    background: "linear-gradient(145deg, rgba(15,23,42,0.9), rgba(17,24,39,0.95))",
                     border: "1px solid rgba(148,163,184,0.5)",
-                    boxShadow:
-                        "0 22px 50px rgba(15,23,42,0.9), 0 0 0 1px rgba(15,23,42,0.7)",
+                    boxShadow: "0 22px 50px rgba(15,23,42,0.9), 0 0 0 1px rgba(15,23,42,0.7)",
                     backdropFilter: "blur(24px)",
                     marginBottom: "1.5rem",
                 }}
@@ -191,8 +330,7 @@ export default function MatchesPage() {
                             padding: "1.4rem 0 0.6rem",
                         }}
                     >
-                        No active round. Press{" "}
-                        <strong style={{ color: "#f97373" }}>Reroll Courts</strong> below to draw doubles for courts 1–5. 🎅
+                        No active round. Press <strong style={{ color: "#f97373" }}>Reroll Courts</strong> below to draw doubles for courts 1–5
                     </p>
                 ) : (
                     <div
@@ -203,7 +341,7 @@ export default function MatchesPage() {
                         }}
                     >
                         {matches.map((match) => {
-                            const winner = winners[match.courtNumber];
+                            const winnerLabel = getWinnerLabel(match.courtNumber);
 
                             return (
                                 <div
@@ -212,8 +350,7 @@ export default function MatchesPage() {
                                         borderRadius: "1.1rem",
                                         border: "1px solid rgba(148,163,184,0.6)",
                                         padding: "0.9rem 0.95rem",
-                                        background:
-                                            "linear-gradient(135deg, rgba(15,23,42,0.9), rgba(15,23,42,0.98))",
+                                        background: "linear-gradient(135deg, rgba(15,23,42,0.9), rgba(15,23,42,0.98))",
                                         boxShadow: "0 10px 28px rgba(15,23,42,0.9)",
                                     }}
                                 >
@@ -232,11 +369,57 @@ export default function MatchesPage() {
                       </span>
                                         </div>
 
-                                        {winner && (
+                                        {winnerLabel && (
                                             <span style={{ fontSize: "0.75rem", color: "#4ade80", fontWeight: 600 }}>
-                        {winner === "SIDE_1" ? "Side 1" : "Side 2"} 🎉
+                        {winnerLabel}
                       </span>
                                         )}
+                                    </div>
+
+                                    <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.75rem" }}>
+                                        <div style={{ flex: 1 }}>
+                                            <div style={{ fontSize: "0.75rem", color: "#9ca3af", marginBottom: "0.25rem" }}>
+                                                Side 1 score
+                                            </div>
+                                            <input
+                                                inputMode="numeric"
+                                                type="number"
+                                                min={0}
+                                                value={scoresByCourt[match.courtNumber]?.side1 ?? ""}
+                                                onChange={(e) => setCourtScore(match.courtNumber, "side1", e.target.value)}
+                                                style={{
+                                                    width: "100%",
+                                                    borderRadius: "0.8rem",
+                                                    border: "1px solid rgba(148,163,184,0.6)",
+                                                    background: "rgba(15,23,42,0.6)",
+                                                    color: "#e5e7eb",
+                                                    padding: "0.35rem 0.55rem",
+                                                    outline: "none",
+                                                }}
+                                            />
+                                        </div>
+
+                                        <div style={{ flex: 1 }}>
+                                            <div style={{ fontSize: "0.75rem", color: "#9ca3af", marginBottom: "0.25rem" }}>
+                                                Side 2 score
+                                            </div>
+                                            <input
+                                                inputMode="numeric"
+                                                type="number"
+                                                min={0}
+                                                value={scoresByCourt[match.courtNumber]?.side2 ?? ""}
+                                                onChange={(e) => setCourtScore(match.courtNumber, "side2", e.target.value)}
+                                                style={{
+                                                    width: "100%",
+                                                    borderRadius: "0.8rem",
+                                                    border: "1px solid rgba(148,163,184,0.6)",
+                                                    background: "rgba(15,23,42,0.6)",
+                                                    color: "#e5e7eb",
+                                                    padding: "0.35rem 0.55rem",
+                                                    outline: "none",
+                                                }}
+                                            />
+                                        </div>
                                     </div>
 
                                     <div style={{ marginBottom: "0.3rem", fontSize: "0.8rem", color: "#9ca3af" }}>
@@ -276,7 +459,6 @@ export default function MatchesPage() {
                                             borderRadius: "0.8rem",
                                             background: "rgba(30,64,175,0.35)",
                                             padding: "0.35rem 0.55rem",
-                                            marginBottom: "0.75rem",
                                         }}
                                     >
                                         {match.side2.map((p, idx) => (
@@ -296,50 +478,6 @@ export default function MatchesPage() {
                                             </div>
                                         ))}
                                     </div>
-
-                                    <div style={{ display: "flex", gap: "0.45rem" }}>
-                                        <button
-                                            type="button"
-                                            onClick={() => handleSetWinner(match.courtNumber, "SIDE_1")}
-                                            style={{
-                                                flex: 1,
-                                                padding: "0.3rem 0.4rem",
-                                                borderRadius: "999px",
-                                                border:
-                                                    winner === "SIDE_1"
-                                                        ? "1px solid rgba(74,222,128,0.9)"
-                                                        : "1px solid rgba(148,163,184,0.9)",
-                                                background:
-                                                    winner === "SIDE_1" ? "rgba(34,197,94,0.18)" : "transparent",
-                                                fontSize: "0.8rem",
-                                                color: "#e5e7eb",
-                                                cursor: "pointer",
-                                            }}
-                                        >
-                                            Side 1 won
-                                        </button>
-
-                                        <button
-                                            type="button"
-                                            onClick={() => handleSetWinner(match.courtNumber, "SIDE_2")}
-                                            style={{
-                                                flex: 1,
-                                                padding: "0.3rem 0.4rem",
-                                                borderRadius: "999px",
-                                                border:
-                                                    winner === "SIDE_2"
-                                                        ? "1px solid rgba(74,222,128,0.9)"
-                                                        : "1px solid rgba(148,163,184,0.9)",
-                                                background:
-                                                    winner === "SIDE_2" ? "rgba(34,197,94,0.18)" : "transparent",
-                                                fontSize: "0.8rem",
-                                                color: "#e5e7eb",
-                                                cursor: "pointer",
-                                            }}
-                                        >
-                                            Side 2 won
-                                        </button>
-                                    </div>
                                 </div>
                             );
                         })}
@@ -347,7 +485,6 @@ export default function MatchesPage() {
                 )}
             </section>
 
-            {/* Bottom controls */}
             <div style={{ display: "flex", gap: "1rem", justifyContent: "center", flexWrap: "wrap" }}>
                 <button
                     type="button"
@@ -371,20 +508,20 @@ export default function MatchesPage() {
                 <button
                     type="button"
                     onClick={handleSaveResults}
-                    disabled={!allWinnersSelected || !hasActiveRound}
+                    disabled={!allScoresEntered || !hasActiveRound}
                     style={{
                         minWidth: "150px",
                         padding: "0.6rem 1.4rem",
                         borderRadius: "999px",
                         border: "none",
                         background:
-                            allWinnersSelected && hasActiveRound
+                            allScoresEntered && hasActiveRound
                                 ? "linear-gradient(135deg, #22c55e, #4ade80)"
-                                : "rgba(21,128,61,0.4)",
-                        color: "#022c22",
+                                : "rgba(34,197,94,0.25)",
+                        color: allScoresEntered && hasActiveRound ? "#06230f" : "rgba(6,35,15,0.6)",
                         fontWeight: 700,
                         fontSize: "0.9rem",
-                        cursor: allWinnersSelected && hasActiveRound ? "pointer" : "not-allowed",
+                        cursor: allScoresEntered && hasActiveRound ? "pointer" : "not-allowed",
                     }}
                 >
                     ✅ Save Results
@@ -392,7 +529,7 @@ export default function MatchesPage() {
 
                 <button
                     type="button"
-                    onClick={() => router.push("/players")}
+                    onClick={() => router.push(`/players?t=${encodeURIComponent(tournamentId)}`)}
                     style={{
                         minWidth: "150px",
                         padding: "0.6rem 1.4rem",
@@ -406,6 +543,46 @@ export default function MatchesPage() {
                     }}
                 >
                     ✏️ Edit Players
+                </button>
+
+                <button
+                    type="button"
+                    onClick={handleShareLeaderboard}
+                    style={{
+                        minWidth: "180px",
+                        padding: "0.6rem 1.4rem",
+                        borderRadius: "999px",
+                        border: "1px solid rgba(148,163,184,0.8)",
+                        background: "rgba(30,41,59,0.9)",
+                        color: "#e5e7eb",
+                        fontWeight: 600,
+                        fontSize: "0.9rem",
+                        cursor: "pointer",
+                        boxShadow: "0 8px 20px rgba(15,23,42,0.5)",
+                    }}
+                >
+                    🔗 Share Leaderboard
+                </button>
+
+                <button
+                    type="button"
+                    onClick={() => {
+                        const url = `/leaderboard?t=${encodeURIComponent(tournamentId)}`;
+                        window.open(url, "_blank", "noopener,noreferrer");
+                    }}
+                    style={{
+                        minWidth: "150px",
+                        padding: "0.6rem 1.4rem",
+                        borderRadius: "999px",
+                        border: "none",
+                        background: "#FFDD00",
+                        color: "#1f2937",
+                        fontWeight: 700,
+                        fontSize: "0.9rem",
+                        cursor: "pointer",
+                    }}
+                >
+                    👑 Open Leaderboard
                 </button>
             </div>
         </main>
